@@ -1,0 +1,88 @@
+name: Publish Tag Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  release:
+    name: Publish Tag Release
+    runs-on: ubuntu-latest
+    steps:
+    # tag 推送只触发轻量发布流程：产物复用最新 main 构建（避免重复编译 x264/ffmpeg）
+    - name: Find latest main build run
+      id: find
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        RUN_ID=$(gh api "repos/${{ github.repository }}/actions/runs?workflow=build.yml&branch=main&status=success&event=push&per_page=1" \
+          --jq '.workflow_runs[0].id')
+        if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
+          echo "::error::未找到 main 分支的成功构建" && exit 1
+        fi
+        echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+
+    - name: Download build artifacts
+      uses: actions/download-artifact@v8
+      with:
+        run-id: ${{ steps.find.outputs.run_id }}
+        pattern: ddnet-rs-*
+        # keep artifacts in separate folders to avoid filename collisions
+        merge-multiple: false
+
+    - name: Download AppImage artifact
+      uses: actions/download-artifact@v8
+      with:
+        run-id: ${{ steps.find.outputs.run_id }}
+        name: ddnet-rs-x86_64-appimage
+        path: appimage
+
+    - name: Re-zip each artifact folder with original name
+      run: |
+        set -euo pipefail
+        mkdir -p release-artifacts
+        shopt -s nullglob
+        for d in ddnet-rs-*; do
+          if [ -d "$d" ]; then
+            echo "Zipping contents of $d -> release-artifacts/$d.zip"
+            (
+              cd "$d"
+              zip -qr "../release-artifacts/$d.zip" *
+            )
+          fi
+        done
+        if [ -d appimage ]; then
+          cp appimage/*.AppImage release-artifacts/ 2>/dev/null || true
+        fi
+
+    - name: Generate BLAKE3 checksums
+      run: |
+        set -euo pipefail
+        sudo apt-get update
+        sudo apt-get install -y b3sum
+        cd release-artifacts
+        for f in *; do
+          [ -f "$f" ] || continue
+          hash=$(b3sum "$f" | awk '{print $1}')
+          echo "$f $hash" >> blake3_checksum.txt
+        done
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v3
+      with:
+        tag_name: ${{ github.ref_name }}
+        name: ${{ github.ref_name }}
+        body: |
+          Automated release from latest main build.
+          Build run: ${{ steps.find.outputs.run_id }}
+        draft: false
+        prerelease: false
+        files: |
+          release-artifacts/*.zip
+          release-artifacts/*.AppImage
+          release-artifacts/blake3_checksum.txt
